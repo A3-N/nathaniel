@@ -50,7 +50,6 @@ If you don't have an automatic speech recognition (ASR) you could use the Whispe
 
 ```bash
 git clone https://github.com/ggerganov/whisper.cpp
-# or
 wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin
 ```
 
