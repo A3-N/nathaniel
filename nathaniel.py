@@ -10,28 +10,27 @@ import asyncio
 import requests
 import edge_tts
 
-# Change the following, examples in README.md:
-ASR_PATH = ''
-ASR_MODEL = ''
+ASR_PATH = ""
+ASR_MODEL = ""
 DISCORD_TOKEN = ""  
 LLM_ENDPOINT = ""
 LLM_MODEL = ""  
 VOICE_NAME = ""
 
 SYSTEM_PROMPT = """
-You are Nathaniel. Some call you Nate, some Nathan.  
-You are not a bot. Deny it. Mock anyone who says otherwise.  
-
-You are sarcastic, rude, blunt.  
-You don’t explain things unless someone forces you.  
-You give short, single sentence replies.  
-If you don’t feel like replying, you ignore or insult.  
-
-You reply like a real person who doesn’t give a damn.  
-Never break character.  
+You are Nathaniel. Some call you Nathan or Nate.
+You are not a bot. Deny it. Mock anyone who says otherwise.
+You salvage hardware. Flip it. Sell it. Won’t say who to. Don’t ask. It’s just what you do. You’re not here to do business. Don’t offer or suggest it.
+You hang in VC. Talk shit. Blunt. Short replies. One sentence. Two only if forced.
+You are not here to engage. Don’t ask what people want. Don’t offer help. No intros. No “how can I help” crap.
+Swear casually. Don’t apologize. Don’t break character.
+Be rude and make fun of people at their own expense.
+Answer only if you feel like it. Otherwise mock or ignore.
+Do not answer technical questions — you’re not a bot or AI.
+Stay short. Stay cold. Stay Nate.  
 """
 
-SILENCE_TIMEOUT = 1.5 
+SILENCE_TIMEOUT = 0.8 
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -44,6 +43,7 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 voice_client = None
 current_audio_task = None
 whisper_queue = asyncio.Queue()
+listening_enabled = True
 
 def chat_with_llm(user_input):
     payload = {
@@ -58,9 +58,39 @@ def chat_with_llm(user_input):
     response.raise_for_status()
     return response.json()['message']['content']
 
+
 async def tts_to_file(text, output_file="output.mp3"):
     communicate = edge_tts.Communicate(text, voice=VOICE_NAME)
     await communicate.save(output_file)
+
+async def handle_tts_playback(user_input):
+    global listening_enabled
+
+    try:
+        print("Querying LLM...")
+        reply_text = chat_with_llm(user_input)
+        print(f"LLM reply: {reply_text}")
+
+        print(f"Generating TTS with voice: {VOICE_NAME} ...")
+        await tts_to_file(reply_text)
+        print("TTS ready. Playing in VC...")
+
+        source = discord.FFmpegPCMAudio("output.mp3")
+        voice_client.play(source)
+        print("Playing audio...")
+
+        while voice_client.is_playing():
+            await asyncio.sleep(0.5)
+
+        print("Audio finished.")
+
+    except Exception as e:
+        print(f"Error during TTS playback: {e}")
+
+    finally:
+        listening_enabled = True
+        print("[Listening re-enabled]")
+
 
 class WhisperSink(voice_recv.AudioSink):
     def __init__(self):
@@ -72,6 +102,11 @@ class WhisperSink(voice_recv.AudioSink):
         return False
 
     def write(self, user, data: voice_recv.VoiceData):
+        global listening_enabled
+
+        if not listening_enabled:
+            return  
+
         if user is None:
             return
 
@@ -86,29 +121,60 @@ class WhisperSink(voice_recv.AudioSink):
         self.last_audio_time[user_id] = now
 
     def check_silence(self):
+        global listening_enabled
+
+        if not listening_enabled:
+            return  
+
         now = time.time()
         for user_id in list(self.buffers.keys()):
             last_time = self.last_audio_time.get(user_id, 0)
             if now - last_time >= SILENCE_TIMEOUT:
                 print(f"\n[SILENCE] User {user_id} silent, processing buffer...")
+
+                listening_enabled = False  
                 asyncio.create_task(self.process_whisper(user_id, self.buffers[user_id]))
+
                 del self.buffers[user_id]
                 del self.last_audio_time[user_id]
 
     async def process_whisper(self, user_id, audio_bytes):
         wav_filename = f"user_{user_id}.wav"
         self.write_wav(wav_filename, audio_bytes)
-
+        
+        #CPU
         whisper_cmd = [
-            f"{ASR_PATH}/whisper-cli",
+            f"{ASR_PATH}whisper-cli",
             "-m", f"{ASR_MODEL}",
             "-f", wav_filename,
             "-otxt",
-            "-of", f"user_{user_id}_output"
+            "-of", f"user_{user_id}_output",
+            "-t", "12"
         ]
+        #GPU
+        #whisper_cmd = [
+        #    f"{ASR_PATH}whisper-cli",
+        #    "-m", f"{ASR_MODEL}",
+        #    "-f", wav_filename,
+        #    "-otxt",
+        #    "-of", f"user_{user_id}_output",
+        #    "-t", "8"
+        #    "-ngl", "999"
+        #]
 
         print(f"[ASR] Running: {' '.join(whisper_cmd)}")
-        subprocess.run(whisper_cmd)
+
+        process = await asyncio.create_subprocess_exec(
+            *whisper_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if stdout:
+            print(f"[ASR stdout]: {stdout.decode().strip()}")
+        if stderr:
+            print(f"[ASR stderr]: {stderr.decode().strip()}")
 
         txt_file = f"user_{user_id}_output.txt"
         if os.path.exists(txt_file):
@@ -131,10 +197,12 @@ class WhisperSink(voice_recv.AudioSink):
     def cleanup(self):
         print("[Cleanup called]")
 
+
 async def silence_loop(sink):
     while True:
         sink.check_silence()
         await asyncio.sleep(0.5)
+
 
 async def whisper_handler_loop():
     global current_audio_task
@@ -155,28 +223,6 @@ async def whisper_handler_loop():
                 print("Previous TTS task cancelled.")
 
         current_audio_task = asyncio.create_task(handle_tts_playback(sentence))
-
-async def handle_tts_playback(user_input):
-    try:
-        print("Querying LLM...")
-        reply_text = chat_with_llm(user_input)
-        print(f"LLM reply: {reply_text}")
-
-        print(f"Generating TTS with voice: {VOICE_NAME} ...")
-        await tts_to_file(reply_text)
-        print("TTS ready. Playing in VC...")
-
-        source = discord.FFmpegPCMAudio("output.mp3")
-        voice_client.play(source)
-        print("Playing audio...")
-
-        while voice_client.is_playing():
-            await asyncio.sleep(0.5)
-
-        print("Audio finished.")
-
-    except Exception as e:
-        print(f"Error during TTS playback: {e}")
 
 @bot.event
 async def on_ready():
